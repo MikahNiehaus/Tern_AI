@@ -87,17 +87,17 @@ itself.
 
 ## Running it
 
+One entry point, `gui.bat`, a small tkinter app with three tabs:
+
 ```
-scripts/run.bat    train, one button, auto resumes and moves to the next
-                    stage on its own (pretraining, then fine tuning)
-scripts/stop.bat    pause training, safe to run any time, checkpoints
-                    save on their own along the way
-scripts/talk.bat    talk to whatever checkpoint currently exists,
-                    raw completion, no retrieval, no tools
-scripts/chat.bat    the real interface, needs fine tuning to be done,
-                    retrieval and tool use both live here
+Train    start/stop pretraining and fine tuning, auto resumes and moves
+         to the next stage on its own, live log output
+Talk     talk to whatever checkpoint currently exists, raw completion,
+         no retrieval, no tools
+Chat     the real interface, needs fine tuning to be done, retrieval
+         and tool use both live here
 ```
 
-Inside `chat.bat`, typing a plain question uses the local model and
-index. Prefixing a question with `web: ` searches DuckDuckGo live instead
-and prints the result directly.
+In the Chat tab, typing a plain question uses the local model and index.
+Prefixing a question with `web: ` searches DuckDuckGo live instead and
+prints the result directly, never through the model.
