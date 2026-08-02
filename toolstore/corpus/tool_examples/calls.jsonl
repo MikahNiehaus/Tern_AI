@@ -1,0 +1,16 @@
+{"question": "What is 2 plus 2?", "call": "CALL: calculator(2+2)", "result": 4, "ok": true}
+{"question": "What is 17 times 23?", "call": "CALL: calculator(17*23)", "result": 391, "ok": true}
+{"question": "What is 100 divided by 4?", "call": "CALL: calculator(100/4)", "result": 25.0, "ok": true}
+{"question": "What is 2 to the power of 10?", "call": "CALL: calculator(2**10)", "result": 1024, "ok": true}
+{"question": "What is 9 minus 15?", "call": "CALL: calculator(9-15)", "result": -6, "ok": true}
+{"question": "What is 3 times 3 plus 4?", "call": "CALL: calculator(3*3+4)", "result": 13, "ok": true}
+{"question": "What is 144 divided by 12?", "call": "CALL: calculator(144/12)", "result": 12.0, "ok": true}
+{"question": "What is 7 to the power of 3?", "call": "CALL: calculator(7**3)", "result": 343, "ok": true}
+{"question": "What is negative 5 plus 12?", "call": "CALL: calculator(-5+12)", "result": 7, "ok": true}
+{"question": "What is 50 minus 8 times 2?", "call": "CALL: calculator(50-8*2)", "result": 34, "ok": true}
+{"question": "What is 5 divided by 0?", "call": "CALL: calculator(5/0)", "result": "'5/0' is not a valid or supported arithmetic expression", "ok": false}
+{"question": "What is the square root of banana?", "call": "CALL: calculator(sqrt(banana))", "result": "'sqrt(banana)' is not a valid or supported arithmetic expression", "ok": false}
+{"question": "What is 9 to the power of 9 to the power of 9?", "call": "CALL: calculator(9**9**9)", "result": "result 387420489 is too large, max is 1000000", "ok": false}
+{"question": "What is the current date and time?", "call": "CALL: current_datetime()", "result": "2026-08-01T01:52:03", "ok": true}
+{"question": "What time is it right now?", "call": "CALL: current_datetime()", "result": "2026-08-01T01:52:03", "ok": true}
+{"question": "Can you tell me today's date?", "call": "CALL: current_datetime()", "result": "2026-08-01T01:52:03", "ok": true}
