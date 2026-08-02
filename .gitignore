@@ -36,6 +36,7 @@ logs/
 CLAUDE.md
 SPEC.md
 workspace/
+diagrams.html
 
 # OS/editor cruft
 .DS_Store
