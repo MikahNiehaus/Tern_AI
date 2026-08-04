@@ -65,6 +65,14 @@ _ctx = None
 # against far less constrained text).
 CALL_RE = re.compile(r'CALL:\s*(\w+)\((.*)\)')
 
+# The exact, fixed refusal text model/sft/build_sft_dataset.py's
+# FACTUAL_NOMATCH_EXAMPLES trains for every real factual question the
+# vector store has no confident match for (greetings/small talk train a
+# different, varied reply for the same Context: (none) shape, and are left
+# alone here, a DuckDuckGo search for "hi" would just return noise). Startswith,
+# not equality: generation can still trail off past this fixed sentence.
+NOMATCH_REFUSAL_PREFIX = "I don't have information about that"
+
 
 def is_loaded():
     """True once load() has actually loaded a checkpoint. See talk.py's
@@ -188,15 +196,34 @@ def dispatch_call(match):
     return f"[tool: {name}] Result: {result}"
 
 
+def run_web_search(query):
+    """Runs the live search, catching any exception so a failed lookup ends
+    the turn, not the session. Same guard and same reason as dispatch_call()
+    right above, at the other untrusted external I/O boundary in this file:
+    web_search.py's own broad except is the first line of defense, this is
+    the one that still holds if that ever gets narrowed (its docstring
+    records a real, unmocked failure where an exception that was not a
+    DDGSException killed the whole chat session, and gui.py calls
+    answer_question() from a worker thread where a raise loses the tab's
+    answer too).
+    """
+    try:
+        return web_search(query)
+    except Exception as e:
+        return f"[web search error: {e}]"
+
+
 def answer_question(question):
     """One full turn: routes web: prefixed input straight to DuckDuckGo,
-    otherwise retrieves, builds the matching prompt, generates, and either
-    dispatches a tool call or returns the tagged answer. Returns the full
+    otherwise retrieves, builds the matching prompt, generates, and ends in
+    exactly one of four outcomes, in this order: a dispatched tool call, a
+    live search when the model gave its trained refusal, the retrieved
+    source's answer, or the model's own unsourced answer. Returns the full
     printable response (including the trailing [source: ...]/[tool: ...]
     tag), calls load() first if the checkpoint hasn't been loaded yet.
     """
     if question.lower().startswith("web:"):
-        return web_search(question[len("web:"):].strip())
+        return run_web_search(question[len("web:"):].strip())
 
     load()
     prefix, source = build_prompt(question)
@@ -211,6 +238,25 @@ def answer_question(question):
     call_match = CALL_RE.search(answer)
     if call_match:
         return dispatch_call(call_match)
+    elif answer.startswith(NOMATCH_REFUSAL_PREFIX):
+        # The model gave its trained "I don't know" refusal, so this was a
+        # real factual question it can't answer, not small talk. Fall back
+        # to a live search instead of returning the refusal, same "print the
+        # real result directly, never feed it back through generate()" rule
+        # the web: prefix already follows.
+        #
+        # Checked BEFORE `source is not None` on purpose: retrieve() clearing
+        # the rerank threshold does not mean the model actually used the
+        # context, and pairing a refusal with a [source: ...] tag is both
+        # self contradictory to the user and worse than the search result
+        # they wanted. The model's own refusal is the authoritative signal
+        # that no local answer exists, whatever retrieval thought.
+        result = run_web_search(question)
+        # Tag the real reason: retrieval may well have found a source that
+        # the model then refused to use, and this file's whole contract is
+        # that every answer says where it came from.
+        why = "model refused the local match" if source is not None else "no local match"
+        return f"{result}\n[{why}, fell back to live search]"
     elif source is not None:
         return f"{answer}\n[source: {source['metadata']['title']}, rerank score: {source['score']:.2f}]"
     else:

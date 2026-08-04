@@ -141,6 +141,20 @@ def tokenize_example(full_text, prefix_text):
 
 
 def rag_examples(limit):
+    """Known, accepted limitation, measured by bad-cop against the real
+    30,000 sampled rows with the real gpt2 encoder: 9 of them (0.03%, e.g.
+    "ISO 639:p", whose prefix alone is 10,430 tokens) are longer than
+    BLOCK_SIZE before the trailing "\\n" is reached, so tokenize_example()
+    truncates the stop token away and the longest of those end up fully
+    masked, contributing no training signal at all. Not fixed here: forcing
+    a stop token onto a row cut off mid context would teach the model to
+    stop mid summary, and dropping rows would need the dataset rebuilt.
+    Same "good enough to ship, not perfectly clean" tolerance tool_examples()
+    documents for corpus coincidence collisions. Safe at this scale because
+    the loss is computed over the flattened batch (model.py's cross_entropy
+    with ignore_index=-1), so a fully masked row costs a slot, not a NaN,
+    unless an entire batch were drawn from those 9 rows out of ~90,000.
+    """
     stride = None
     with open(WIKI_TSV, "r", encoding="utf-8") as f:
         total = sum(1 for _ in f)
@@ -156,7 +170,7 @@ def rag_examples(limit):
             title, summary = line.rstrip("\n").split("\t", 1)
             question = f"What is {title}?"
             prefix = f"Context: {summary}\nQuestion: {question}\nAnswer:"
-            full = prefix + " " + summary
+            full = prefix + " " + summary + "\n"
             rows.append((full, prefix))
     return rows
 
@@ -200,7 +214,7 @@ def tool_examples(repeats):
             question = t["question"]
             call = t["call"]
             prefix = f"Context: (none)\nQuestion: {question}\nAnswer:"
-            full = prefix + " " + call
+            full = prefix + " " + call + "\n"
             rows.append((full, prefix))
     return rows
 
@@ -211,7 +225,7 @@ def nomatch_examples(repeats):
     for _ in range(repeats):
         for question, answer in all_examples:
             prefix = f"Context: (none)\nQuestion: {question}\nAnswer:"
-            full = prefix + " " + answer
+            full = prefix + " " + answer + "\n"
             rows.append((full, prefix))
     return rows
 
