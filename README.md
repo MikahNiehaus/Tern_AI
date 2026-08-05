@@ -18,6 +18,7 @@ flowchart LR
         TOK --> BASE[GPT-2 small\n12L 12H 768D\nrandom init]
     end
     subgraph Fine tuning
+        SIMPLE[Simple English\nWikipedia] --> SFT
         BASE --> SFT[SFT: 3 fixed\nprompt shapes]
         SFT --> FT[fine tuned\ncheckpoint]
     end
@@ -27,7 +28,24 @@ flowchart LR
 Base pretraining and fine tuning are two separate stages with their own
 checkpoints. An orchestrator script checks checkpoint state on start and
 resumes or advances automatically, so a multi day run can be paused and
-picked back up without manual bookkeeping.
+picked back up without manual bookkeeping. It also downloads Simple
+English Wikipedia on its own and rebuilds the fine tuning dataset whenever
+the real inputs change, checked by a content fingerprint, not just whether
+the output files happen to exist, so a stale checkpoint never gets treated
+as current just because nobody remembered to rebuild by hand.
+
+The retrieval grounded answer shape is trained on real, independently
+written paraphrases where one exists, not the retrieved passage copied
+verbatim: Simple English Wikipedia is a separate Wikimedia project written
+by human editors in simpler language, joined to the regular English corpus
+by article title. No generative AI produced any of this training data, in
+keeping with the point of the project: an earlier attempt at prompting
+the base model itself to paraphrase was tested directly and failed, the
+model hallucinated and drifted off topic within a sentence, consistent
+with in context learning being unreliable well below 1 billion parameters,
+the same reason the fine tuning stage exists in the first place. An
+article with no Simple Wikipedia match still falls back to the original,
+verbatim behavior rather than being dropped.
 
 ## Retrieval
 
@@ -90,14 +108,26 @@ itself.
 One entry point, `gui.bat`, a small tkinter app with three tabs:
 
 ```
-Train    start/stop pretraining and fine tuning, auto resumes and moves
-         to the next stage on its own, live log output
-Talk     talk to whatever checkpoint currently exists, raw completion,
-         no retrieval, no tools
-Chat     the real interface, needs fine tuning to be done, retrieval
-         and tool use both live here
+Train                     start/stop pretraining, downloading the Simple
+                           Wikipedia corpus, and fine tuning, auto resumes
+                           and moves to the next stage on its own (including
+                           rebuilding the fine tuning dataset and starting a
+                           fresh fine tuning run if the data it was trained
+                           on ever changes), live log output
+Talk to AI                talk to whatever checkpoint currently exists, raw
+                           completion, no retrieval, no tools
+Talk to AI using RAG      the real interface, needs fine tuning to be done,
+                           retrieval and tool use both live here
 ```
 
-In the Chat tab, typing a plain question uses the local model and index.
-Prefixing a question with `web: ` searches DuckDuckGo live instead and
-prints the result directly, never through the model.
+The "Talk to AI using RAG" tab has a Source toggle: answer from the vector
+store with DuckDuckGo as a fallback when nothing confident is found (the
+default), the vector store only with no fallback, or the model on its own
+with DuckDuckGo only as a fallback. Typing a plain question uses whichever
+is selected; prefixing a question with `web: ` always searches DuckDuckGo
+live instead, regardless of the toggle, and prints the result directly,
+never through the model. Any answer grounded in a retrieved passage has a
+"show RAG context" link underneath it that expands to the exact text the
+model was actually given that turn, and every real turn (question, mode,
+the full retrieved passage or live search result if one was used, the
+final answer) is written to `logs/chat_turns.log` for later review.

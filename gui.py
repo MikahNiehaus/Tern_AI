@@ -101,7 +101,7 @@ class TrainTab(ttk.Frame):
         top.pack(fill="x", padx=8, pady=8)
         self.status_var = tk.StringVar(value="Checking...")
         ttk.Label(top, textvariable=self.status_var, wraplength=520).pack(side="left", fill="x", expand=True)
-        self.start_btn = ttk.Button(top, text="Start", command=self.start)
+        self.start_btn = ttk.Button(top, text="Train", command=self.start)
         self.start_btn.pack(side="right", padx=4)
         self.stop_btn = ttk.Button(top, text="Stop", command=self.stop)
         self.stop_btn.pack(side="right", padx=4)
@@ -267,14 +267,25 @@ class _ChatLikeTab(ttk.Frame):
     def drain_queue(self):
         try:
             while True:
-                kind, text = self.result_queue.get_nowait()
-                self.append(text + "\n\n")
+                kind, payload = self.result_queue.get_nowait()
                 if kind == "answer":
+                    self.render_answer(payload)
                     self.send_btn.state(["!disabled"])
                     self._busy = False
+                else:
+                    self.append(str(payload) + "\n\n")
         except queue.Empty:
             pass
         self.after(100, self.drain_queue)
+
+    def render_answer(self, payload):
+        """Default rendering: payload is the plain answer string. ChatTab
+        overrides this since its _call() returns a richer dict (the answer
+        text plus the RAG context that was actually fed into the model, for
+        the expandable context viewer), TalkTab's payload is already just a
+        string and needs nothing extra.
+        """
+        self.append(str(payload) + "\n\n")
 
 
 class TalkTab(_ChatLikeTab):
@@ -289,21 +300,114 @@ class ChatTab(_ChatLikeTab):
     module_name = "chat"
     hint_text = "Needs SFT to have finished. Prefix a question with 'web:' to search DuckDuckGo live instead of the local model."
 
+    def __init__(self, master):
+        super().__init__(master)
+        # A tk.StringVar read from send()'s worker thread via _call() below,
+        # not written from it: only .get() ever happens off the main thread,
+        # the same read only pattern _worker() already uses for
+        # self.module_name and self.hint_text, so it needs no lock.
+        self.mode_var = tk.StringVar(value="auto")
+        modes = ttk.Frame(self)
+        modes.pack(fill="x", padx=8, pady=(0, 4))
+        ttk.Label(modes, text="Source:").pack(side="left")
+        # Labels name the knowledge source each mode actually uses. "web" is
+        # NOT a pure web search mode: it turns off the vector store only, the
+        # model still runs and can still answer or dispatch a tool, and a live
+        # search happens only on the model's own refusal, exactly as under
+        # "auto" (see chat.answer_question()'s own docstring). Labelling it
+        # "Web only" described the shape this mode had before that redesign.
+        for value, label in (
+            ("auto", "Vector, web if no match"),
+            ("vector", "Vector only"),
+            ("web", "Model only, web if no match"),
+        ):
+            ttk.Radiobutton(modes, text=label, value=value, variable=self.mode_var).pack(side="left", padx=4)
+
+        # One shared style for every turn's "[+ show RAG context]" link.
+        # -elide is the real Tk mechanism for a collapsible text region (Tcl/Tk
+        # text(3tk) manual: elided text "is not displayed and takes no space
+        # on screen, but further on behaves just as normal data"), not a hand
+        # rolled delete/reinsert: a tag's own range tracking already survives
+        # later inserts elsewhere in the widget, so nothing else needs to
+        # bookend it. Same wiki.tcl-lang.org "Text widget elision" shape:
+        # tag the region once, then only ever flip -elide on click.
+        self.output.tag_configure("rag_link", foreground="#5b8def", underline=True)
+        self._ctx_turn = 0
+
     def _call(self, module, text):
-        return module.answer_question(text)
+        return module.answer_turn(text, mode=self.mode_var.get())
+
+    def render_answer(self, result):
+        """result is answer_turn()'s dict: text plus, when the RAG shape
+        produced this answer (or the model refused a context it was given),
+        the exact text that was in the Context: block this turn. Renders a
+        clickable "[+ show RAG context]" link right under the answer when
+        there is one; everything else prints exactly like TalkTab's plain
+        text.
+        """
+        self.output.configure(state="normal")
+        self.output.insert("end", result["text"])
+        context = result.get("context")
+        if context:
+            self._ctx_turn += 1
+            link_tag = f"rag_link_{self._ctx_turn}"
+            ctx_tag = f"rag_ctx_{self._ctx_turn}"
+            title = result.get("source_title") or "the retrieved passage"
+            self.output.insert("end", "\n")
+            self.output.insert("end", "[+ show RAG context]", (link_tag, "rag_link"))
+            self.output.insert("end", f"\n{title}:\n{context}\n", (ctx_tag,))
+            self.output.tag_configure(ctx_tag, elide=True, foreground="#8a8a92")
+            self.output.tag_bind(link_tag, "<Button-1>",
+                                  lambda e, lt=link_tag, ct=ctx_tag: self._toggle_context(lt, ct))
+            self.output.tag_bind(link_tag, "<Enter>", lambda e: self.output.config(cursor="hand2"))
+            self.output.tag_bind(link_tag, "<Leave>", lambda e: self.output.config(cursor=""))
+        self.output.insert("end", "\n\n")
+        self.output.see("end")
+        self.output.configure(state="disabled")
+
+    def _toggle_context(self, link_tag, ctx_tag):
+        # tag_cget's "elide" comes back as the string "1"/"0", not a real
+        # bool (found by testing, Tkinter's own cget always returns Tcl's
+        # string representation), so compare against the string.
+        self.output.configure(state="normal")
+        is_hidden = self.output.tag_cget(ctx_tag, "elide") == "1"
+        self.output.tag_configure(ctx_tag, elide=not is_hidden)
+        link_range = self.output.tag_ranges(link_tag)
+        if link_range:
+            label = "[- hide RAG context]" if is_hidden else "[+ show RAG context]"
+            self.output.delete(link_range[0], link_range[1])
+            self.output.insert(link_range[0], label, (link_tag, "rag_link"))
+        self.output.configure(state="disabled")
 
 
 def main():
     root = tk.Tk()
     root.title("Tern AI")
     root.geometry("820x640")
+    icon_path = os.path.join(HERE, "tern_icon.ico")
+    if os.path.exists(icon_path):
+        try:
+            root.iconbitmap(icon_path)
+        except tk.TclError as e:
+            # Real title bar icon is nice to have, never worth taking the
+            # whole app down over. What actually raises here, measured on
+            # this machine (Tk 8.6.13): a path Tk cannot open at all, as
+            # 'bitmap "..." not defined'. os.path.exists() above screens
+            # that out but cannot rule it out, since the file can go away
+            # between the check and this call. Malformed CONTENT does not
+            # raise: garbage bytes, a truncated .ico and a real .ico with a
+            # zeroed body were each accepted silently, leaving the default
+            # icon. So this guard is for the unopenable path, not a corrupt
+            # file, and it logs rather than passing so a missing icon is
+            # visible in the log instead of a silent mystery.
+            logger.error("could not set window icon: %s", e, exc_info=True)
 
     notebook = ttk.Notebook(root)
     notebook.pack(fill="both", expand=True)
 
     notebook.add(TrainTab(notebook), text="Train")
-    notebook.add(TalkTab(notebook), text="Talk")
-    notebook.add(ChatTab(notebook), text="Chat")
+    notebook.add(TalkTab(notebook), text="Talk to AI")
+    notebook.add(ChatTab(notebook), text="Talk to AI using RAG")
 
     root.mainloop()
 

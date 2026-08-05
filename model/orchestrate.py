@@ -5,14 +5,29 @@ do something else. Answers the real question asked: "why do I have to
 know which script to run and why doesn't it switch to the next phase on
 its own" — this is that missing piece.
 
-Five states, checked in order:
+Six states, checked in order:
 1. No base checkpoint yet -> start base pretraining from scratch.
 2. Base checkpoint exists, not yet at max_iters -> resume base pretraining.
-3. Base training done, SFT dataset not built yet -> build it (quick, not
-   itself resumable, just a one time data prep step).
-4. SFT dataset built, SFT checkpoint not yet at max_iters -> run (or
-   resume) SFT training.
-5. Everything done -> launch toolstore/chat.py, the real RAG + tool using
+3. Base training done, Simple Wikipedia corpus not downloaded yet -> get
+   it (toolstore/download_simple_wikipedia.py), so a fresh clone gets real
+   paraphrase trained answers, not the copy the summary verbatim fallback,
+   without anyone needing to know that script exists.
+4. Simple Wikipedia downloaded, SFT dataset missing or stale -> build or
+   rebuild it (quick, not itself resumable, just a one time data prep
+   step). Stale means dataset_needs_rebuild() found the real inputs (either
+   Wikipedia corpus, the tool traces, or build_sft_dataset.py's own logic)
+   changed since the .npy files on disk were built, not just "do the files
+   exist": running this again after downloading Simple Wikipedia for the
+   first time, with an SFT checkpoint already fully trained on the old,
+   verbatim only data, is exactly the case this exists to catch, so it
+   does not just launch chat on stale weights forever.
+5. SFT dataset built and current, SFT checkpoint not yet at max_iters ->
+   run (or resume) SFT training. If the dataset was just rebuilt because it
+   was stale, any existing SFT checkpoint was already retired (moved aside,
+   never deleted) by state 4, so this starts a real fresh SFT run against
+   the corrected data instead of resuming more training on top of stale
+   weights.
+6. Everything done -> launch toolstore/chat.py, the real RAG + tool using
    chat loop (talk.py is raw base-model sampling only, useful mid training,
    not the end state once SFT is actually done).
 
@@ -29,6 +44,7 @@ import os
 import runpy
 import subprocess
 import sys
+import time
 
 import torch
 
@@ -79,12 +95,19 @@ def main():
     sft_dir = os.path.join(HERE, "sft")
     sft_config = os.path.join(sft_dir, "sft_config.py")
     sft_ckpt = os.path.join(sft_dir, "checkpoints", "ckpt.pt")
-    sft_data_files = [
-        os.path.join(sft_dir, "sft_train_x.npy"),
-        os.path.join(sft_dir, "sft_train_y.npy"),
-        os.path.join(sft_dir, "sft_val_x.npy"),
-        os.path.join(sft_dir, "sft_val_y.npy"),
-    ]
+
+    toolstore_dir = os.path.join(HERE, "..", "toolstore")
+    simple_wiki_tsv = os.path.join(toolstore_dir, "corpus", "simple_wikipedia_summaries", "summaries.tsv")
+
+    # build_sft_dataset.py is a real, importable module (its only top level
+    # work is fast, already installed imports: json, numpy, tiktoken, no
+    # GPU or model load), not run only as a subprocess: dataset_needs_rebuild()
+    # below has to be the exact same check build_sft_dataset.py's own build()
+    # writes the manifest against, so there is one real implementation, not
+    # two that could quietly drift apart and disagree about whether a
+    # rebuild is needed.
+    sys.path.insert(0, sft_dir)
+    import build_sft_dataset
 
     while True:
         base_exists, base_iter, base_max, base_done = phase_status(base_config, base_ckpt)
@@ -98,9 +121,64 @@ def main():
                 continue
             return
 
-        sft_data_built = all(os.path.exists(p) for p in sft_data_files)
-        if not sft_data_built:
-            print("\n=== base training done, building SFT dataset ===\n")
+        if not os.path.exists(simple_wiki_tsv):
+            print("\n=== base training done, downloading Simple Wikipedia "
+                  "(for real paraphrase trained answers, not verbatim copies) ===\n")
+            subprocess.run([python, "download_simple_wikipedia.py"], cwd=toolstore_dir)
+            continue
+
+        if build_sft_dataset.dataset_needs_rebuild():
+            if os.path.exists(sft_ckpt):
+                # The checkpoint on disk was trained against whatever
+                # dataset existed before this rebuild, so resuming it with
+                # --init_from=resume would keep training on top of those
+                # old weights instead of a real, clean run against the
+                # corrected data. Moved aside, never deleted, so sft_exists
+                # below is correctly False afterward and train_sft.py's own
+                # default init_from='sft_init' starts fresh from the base
+                # checkpoint on the corrected dataset.
+                stamp = time.strftime("%Y%m%d_%H%M%S")
+                stale_dir = os.path.join(sft_dir, "checkpoints")
+                stale_path = os.path.join(stale_dir, f"ckpt_stale_{stamp}.pt")
+                print(f"\n=== SFT training data changed, retiring the checkpoint trained "
+                      f"on the old data to {stale_path} ===\n")
+                try:
+                    os.replace(sft_ckpt, stale_path)
+                except FileNotFoundError:
+                    # The GUI's own Train tab already refuses to start a
+                    # second run while one is detected running, so this is
+                    # only reachable by manually launching a second
+                    # orchestrate.py outside the GUI. If that happens to
+                    # race this exact rename, the source is only ever
+                    # missing because some other run already moved it, the
+                    # same real state either way, so there is nothing left
+                    # to do here, not a real failure, only printed so this
+                    # is never the one silent branch in an otherwise fully
+                    # narrated state machine.
+                    print(f"\n=== {sft_ckpt} was already retired by another run, nothing to do here ===\n")
+                except OSError as e:
+                    # bad-cop measured this for real: a locked checkpoint
+                    # file (chat.py still holding it via torch.load, a
+                    # backup/AV tool scanning it, both realistic on a
+                    # Windows box) raises PermissionError here, which used
+                    # to have no handler and crash this whole days-long
+                    # unattended state machine with no narration at all,
+                    # per CLAUDE.md's own note that nothing here auto
+                    # notifies on completion or failure. Stopping cleanly
+                    # with a clear, printed reason (this file already
+                    # narrates every state, this must not be the one silent
+                    # exit) is safer than proceeding: continuing past a
+                    # failed retirement risks building the new dataset while
+                    # the old, stale checkpoint is still in place to be
+                    # resumed from by mistake.
+                    print(f"\n=== ERROR: could not retire stale checkpoint {sft_ckpt} "
+                          f"-> {stale_path}: {e} ===\n"
+                          f"=== not safe to continue: the checkpoint trained on the old "
+                          f"data would still be in place to resume from by mistake. "
+                          f"Check what still has {sft_ckpt} open (a running chat.py, a "
+                          f"backup or antivirus scan) and rerun once it is free. ===\n")
+                    return
+            print("\n=== building SFT dataset ===\n")
             subprocess.run([python, os.path.join("sft", "build_sft_dataset.py")], cwd=HERE)
             continue
 
@@ -117,7 +195,6 @@ def main():
         print("\n" + "=" * 60)
         print("Base training and SFT both complete. Ready to chat.")
         print("=" * 60 + "\n")
-        toolstore_dir = os.path.join(HERE, "..", "toolstore")
         subprocess.run([python, "chat.py"], cwd=toolstore_dir)
         return
 
