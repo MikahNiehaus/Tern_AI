@@ -4,6 +4,14 @@ A GPT-2 sized language model trained from scratch on a single RTX 4070
 SUPER, with a self built retrieval and tool use layer around it. No
 pretrained weights, random initialization, one consumer GPU.
 
+The finished, fine tuned checkpoint is published at
+[huggingface.co/mikahniehaus/Tern](https://huggingface.co/mikahniehaus/Tern)
+for anyone who wants to skip the multi day training run and start from a
+working model; the model card there covers the checkpoint format and how to
+load it with nanoGPT's own `GPT`/`GPTConfig` classes. Everything in this repo
+(the training pipeline, the retrieval and tool layer, the chat loop) still
+runs the same either way, checkpoint trained locally or downloaded.
+
 ## Model
 
 Standard GPT-2 small config: 12 layers, 12 attention heads, 768 embedding
@@ -34,8 +42,8 @@ the real inputs change, checked by a content fingerprint, not just whether
 the output files happen to exist, so a stale checkpoint never gets treated
 as current just because nobody remembered to rebuild by hand.
 
-The retrieval grounded answer shape is trained on real, independently
-written paraphrases where one exists, not the retrieved passage copied
+The retrieval grounded answer shape is trained exclusively on real,
+independently written paraphrases, never the retrieved passage copied
 verbatim: Simple English Wikipedia is a separate Wikimedia project written
 by human editors in simpler language, joined to the regular English corpus
 by article title. No generative AI produced any of this training data, in
@@ -43,9 +51,28 @@ keeping with the point of the project: an earlier attempt at prompting
 the base model itself to paraphrase was tested directly and failed, the
 model hallucinated and drifted off topic within a sentence, consistent
 with in context learning being unreliable well below 1 billion parameters,
-the same reason the fine tuning stage exists in the first place. An
-article with no Simple Wikipedia match still falls back to the original,
-verbatim behavior rather than being dropped.
+the same reason the fine tuning stage exists in the first place.
+
+An article with no real trained paraphrase is never shown as a grounded
+answer at all, rather than falling back to a verbatim copy: the fine
+tuning dataset records the exact set of article titles it actually trained
+a paraphrase for (60,000 of them), and the chat loop checks a retrieval
+hit against that exact list before ever building a `Context:` block from
+it, closed loop, no separate approximation of "which titles were trained"
+that could quietly drift out of sync with what the data build actually
+produced. A title outside that set is treated exactly like a genuine
+retrieval miss.
+
+That closed loop is there because the open version was measured wrong. The
+first version of the check re-derived "which titles were trained" at answer
+time, accepting any article that cleared the same filters the data build
+uses. Counting it against what the build actually wrote found 178,363 of
+238,363 accepted titles, 74.8%, had never been turned into a training row
+at all: the builder streams the corpus in file order and stops once it has
+its 60,000, so three quarters of what that gate let through was exactly the
+never trained case the gate existed to block. Reading the build's own
+output instead leaves one computation of which titles were trained rather
+than two that can quietly disagree.
 
 ## Retrieval
 
@@ -99,6 +126,19 @@ answer, so it goes back in as a `Context:` block and the model generates
 the real answer from it, tagged `AI generated`. Only a search that failed
 or returned nothing prints verbatim, since there is no passage there to
 ground an answer in.
+
+Two real inference time techniques improve answer quality with no
+retraining involved. Nucleus (top-p) sampling narrows the model's word
+choice at every token to the smallest set covering 90% of the real
+probability mass, instead of a fixed count, so it stops occasionally
+sampling a genuinely unlikely word. Best-of-4 reranking generates four
+full candidate answers for any real, grounded prompt (a retrieved passage
+or a live search result) and keeps the one the same cross encoder already
+used for retrieval scores as most relevant to the question, real
+retrieval-augmented generation rather than a single roll of the dice.
+Both are skipped for tool calls and refusals, on purpose: a tool's real
+result and the model's own trained "I don't know" don't get better with
+more sampling, only slower.
 
 ## Stack
 
@@ -159,3 +199,12 @@ turns off. Any answer grounded in a retrieved passage has a
 model was actually given that turn, and every real turn (question, mode,
 the full retrieved passage or live search result if one was used, the
 final answer) is written to `logs/chat_turns.log` for later review.
+
+Closed book mode is honest about its own real limit rather than hiding
+it: the fine tuning dataset only ever pairs a real factual question with
+a trained refusal when there is no `Context:` block, never with a real
+answer, since teaching a 124M model to memorize open ended trivia by
+itself was never the goal, grounding it in real retrieved text was. So
+closed book mode reliably answers a greeting or dispatches a tool, and
+just as reliably says it doesn't know a fact it was never shown a
+`Context:` block for, on purpose, not a bug to route around.

@@ -1458,6 +1458,138 @@ class TestBuildPromptContext(_RealTokenizerTest):
                          "the title still travels with the context, empty or not")
 
 
+class TestQuestionFitsTheBlockBudget(_RealTokenizerTest):
+    """A question long enough to blow the token budget on its own must be
+    truncated here, explicitly, not left to model.py's generate().
+
+    The regression this exists for, found by bad-cop against the real
+    checkpoint: generate() crops with `idx[:, -block_size:]`, from the
+    FRONT, so an over-budget prompt loses its "Context: ...\\nQuestion: "
+    template rather than its tail. Three real runs of a 5000 character
+    question through mode="model" came back "The algorithm is a number of
+    different things that are kinder.", "This is the general-The most
+    countries and counties." and "The word is the number of books in books
+    in the English language." — fluent, confident, empty, and none of them
+    the trained NOMATCH_REFUSAL_PREFIX the closed-book mode is documented
+    (README.md, the Hugging Face model card) to give.
+
+    Every assertion below is about the prompt, not the generated text: what
+    broke was the prompt the model was handed, and that is checkable
+    exactly, without a GPU.
+    """
+
+    # Real inputs, not only the "a"*5000 bad-cop ran: a pasted article, a
+    # a script that is not latin (more bytes and more tokens per
+    # character), and one unbroken run with no whitespace to cheat on.
+    OVERSIZED = {
+        "single repeated character": "a" * 5000,
+        "pasted prose": "What is the capital of France? " * 400,
+        "script that is not latin": "これは何ですか" * 500,
+        "no whitespace at all": "0123456789" * 500,
+    }
+
+    def assert_fits(self, prefix, expected_start):
+        ids = chat._encode(prefix)
+        self.assertLessEqual(
+            len(ids), chat.block_size - chat.max_new_tokens,
+            "the prompt must leave room for max_new_tokens of answer inside "
+            "block_size, or generate() crops the template off the front")
+        # Decoded back from the real ids, not asserted on the string that
+        # went in: what has to survive is what the model is handed, and a
+        # token slice can land mid merge, so the round trip is the honest
+        # check.
+        self.assertTrue(chat._decode(ids).startswith(expected_start),
+                        "the template prefix must survive into the real token ids")
+
+    def test_oversized_question_keeps_the_no_context_template(self):
+        for name, question in self.OVERSIZED.items():
+            with self.subTest(name):
+                with mock.patch.object(chat, "retrieve", return_value=[]):
+                    prefix, best, context_text = chat.build_prompt(question)
+                self.assert_fits(prefix, "Context: (none)\nQuestion: ")
+                self.assertTrue(prefix.endswith("\nAnswer:"))
+                self.assertIsNone(best)
+                self.assertIsNone(context_text)
+
+    def test_oversized_question_keeps_the_template_when_retrieval_is_off(self):
+        """mode="model"/"web" reach the same branch without retrieve()
+        running at all; that is the exact path bad-cop's repro took.
+        """
+        with mock.patch.object(chat, "retrieve") as m_retrieve:
+            prefix, _, _ = chat.build_prompt("a" * 5000, use_retrieval=False)
+        self.assertFalse(m_retrieve.called)
+        self.assert_fits(prefix, "Context: (none)\nQuestion: ")
+
+    def test_oversized_question_keeps_the_template_on_a_gated_title(self):
+        """The paraphrase gate builds the same Context: (none) shape from a
+        real retrieval hit, so it needs the same truncation.
+        """
+        with mock.patch.object(chat, "retrieve", return_value=[SOURCE]), \
+                mock.patch.object(chat, "_get_paraphrase_titles", return_value=set()):
+            prefix, _, _ = chat.build_prompt("a" * 5000)
+        self.assert_fits(prefix, "Context: (none)\nQuestion: ")
+
+    def test_oversized_question_keeps_the_context_template_too(self):
+        """The same over-budget prompt is reachable with a real Context:
+        block (an oversized question leaves the passage empty but the
+        prompt still overflowed: 1260 tokens against block_size 1024), so
+        the Context: shape gets truncated the same way.
+        """
+        for name, question in self.OVERSIZED.items():
+            with self.subTest(name):
+                with mock.patch.object(chat, "retrieve", return_value=[SOURCE]), \
+                        mock.patch.object(chat, "_get_paraphrase_titles",
+                                          return_value={"Paris"}):
+                    prefix, best, _ = chat.build_prompt(question)
+                self.assert_fits(prefix, "Context: ")
+                self.assertIsNotNone(best)
+
+    def test_a_question_that_already_fits_is_never_touched(self):
+        """The other half of the property, and the one that keeps this from
+        being a behavior change: an ordinary question must produce exactly
+        the prompt it always did, both template shapes.
+        """
+        question = "What is the capital of France?"
+        with mock.patch.object(chat, "retrieve", return_value=[]):
+            none_prefix, _, _ = chat.build_prompt(question)
+        self.assertEqual(none_prefix,
+                         f"Context: (none)\nQuestion: {question}\nAnswer:")
+        with mock.patch.object(chat, "retrieve", return_value=[SOURCE]), \
+                mock.patch.object(chat, "_get_paraphrase_titles", return_value={"Paris"}):
+            prefix, _, context_text = chat.build_prompt(question)
+        self.assertEqual(context_text, SOURCE["content"])
+        self.assertEqual(
+            prefix,
+            f"Context: {SOURCE['content']}\nQuestion: {question}\nAnswer:")
+
+    def test_every_length_across_the_budget_boundary_fits(self):
+        """Sweeps the boundary itself rather than trusting one hand picked
+        size: the truncate -> decode -> re-encode round trip does not have
+        to preserve token count (a slice can end mid-merge), so the sizes
+        just under, at, and just over the budget are where an off by a few
+        would actually show up.
+        """
+        for n_tokens in range(880, 1005, 5):
+            question = "word " * n_tokens
+            with self.subTest(n_tokens=n_tokens):
+                with mock.patch.object(chat, "retrieve", return_value=[]):
+                    prefix, _, _ = chat.build_prompt(question)
+                self.assert_fits(prefix, "Context: (none)\nQuestion: ")
+
+    def test_live_search_answer_prompt_also_fits(self):
+        """_live_search_answer() builds its prompt through the same
+        _context_prompt(), with the question straight from the user.
+        """
+        self.install_model()
+        seen = {}
+        with mock.patch.object(chat, "run_web_search",
+                               return_value=(SEARCH_RESULT, False)), \
+                mock.patch.object(chat, "_best_of_n_generate",
+                                  side_effect=lambda prefix, q: seen.setdefault("prefix", prefix) and ""):
+            chat._live_search_answer("a" * 5000)
+        self.assert_fits(seen["prefix"], "Context: ")
+
+
 class TestParaphraseTitleGating(_RealTokenizerTest):
     """The "never copy and paste the RAG result" hard rule's inference-time
     half: build_sft_dataset.py's rag_examples() now trains the RAG shape

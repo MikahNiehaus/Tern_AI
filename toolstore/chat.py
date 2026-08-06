@@ -317,6 +317,35 @@ def truncate_to_tokens(text, max_tokens):
     return _decode(ids[:max_tokens])
 
 
+def _truncate_question(question, context_text):
+    """Cuts the question down to whatever the template budget leaves once
+    `context_text`, the fixed template words, and max_new_tokens of answer
+    are all paid for. The question is the last thing to be cut, and it is
+    cut here rather than left to generate().
+
+    Without this, a question long enough to blow the budget on its own is
+    still truncated, just implicitly and from the wrong end:
+    model.py's generate() crops to `idx[:, -block_size:]`, from the FRONT,
+    so what silently disappears is the "Context: ...\\nQuestion: " prefix,
+    the one part of the prompt the SFT template is built out of. The model
+    then sees an unrecognizable tail of raw text with no template at all
+    and free-associates a fluent, confident, wrong sentence instead of the
+    trained refusal. Measured against the real checkpoint: a 5000 character
+    question encodes to 1262 tokens against block_size 1024, and produced
+    "The words are a list of words, which are written by a computer
+    algorithm." rather than NOMATCH_REFUSAL_PREFIX.
+
+    Truncating the input before it reaches the model, instead of letting
+    the model's own window silently do it, is the same contract
+    HuggingFace tokenizers give with `truncation=True, max_length=...`
+    (right side by default, so the front of the prompt survives), and the
+    same encode -> slice -> decode shape truncate_to_tokens() already uses
+    for the Context: block.
+    """
+    budget = block_size - max_new_tokens - len(_encode(f"Context: {context_text}\nQuestion: \nAnswer:"))
+    return truncate_to_tokens(question, max(budget, 0))
+
+
 def _context_prompt(question, content):
     """Builds a Context:-having prompt for any retrieved text, a vector
     store passage or a live search result alike, truncated to the same
@@ -325,11 +354,32 @@ def _context_prompt(question, content):
     context_text is what was actually fed in, not the raw, untruncated
     input, same "show what the model really saw" reasoning build_prompt()
     already documents for its own context_text return value.
+
+    The retrieved content is what gets cut first, all the way to nothing if
+    that is what the question needs. Only a question that still does not
+    fit against an empty Context: block is itself cut, so every prompt that
+    fits today is built exactly as it was.
     """
     budget = block_size - max_new_tokens - len(_encode(f"Context: \nQuestion: {question}\nAnswer:"))
-    context_text = truncate_to_tokens(content, max(budget, 0))
+    if budget < 0:
+        # There is no passage left to give back: the question alone
+        # overflows the template, so it is the question that has to be cut
+        # (see _truncate_question for what generate() does otherwise).
+        question = _truncate_question(question, "")
+        budget = 0
+    context_text = truncate_to_tokens(content, budget)
     prefix = f"Context: {context_text}\nQuestion: {question}\nAnswer:"
     return prefix, context_text
+
+
+def _no_context_prompt(question):
+    """The Context: (none) half of the same template, for a real retrieval
+    miss, a paraphrase-gated hit, or a mode that never retrieved at all.
+    Truncated the same explicit way _context_prompt() truncates its own
+    inputs: this shape has no passage to cut, so the question is measured
+    directly against the "(none)" template's own overhead.
+    """
+    return f"Context: (none)\nQuestion: {_truncate_question(question, '(none)')}\nAnswer:"
 
 
 def _generate(prefix):
@@ -401,8 +451,7 @@ def build_prompt(question, use_retrieval=True):
     """
     docs = retrieve(question) if use_retrieval else []
     if not docs:
-        prefix = f"Context: (none)\nQuestion: {question}\nAnswer:"
-        return prefix, None, None
+        return _no_context_prompt(question), None, None
 
     best = docs[0]
     if best["metadata"]["title"] not in _get_paraphrase_titles():
@@ -412,8 +461,7 @@ def build_prompt(question, use_retrieval=True):
         # retrieval hit outside that trained set gets the exact same
         # Context: (none) treatment a true miss would, so the model is never
         # asked to paraphrase content it was never taught to.
-        prefix = f"Context: (none)\nQuestion: {question}\nAnswer:"
-        return prefix, None, None
+        return _no_context_prompt(question), None, None
     prefix, context_text = _context_prompt(question, best["content"])
     return prefix, best, context_text
 
