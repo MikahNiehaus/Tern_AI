@@ -31,7 +31,7 @@ import tiktoken
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "model"))
 from model import GPTConfig, GPT
 
-from query import retrieve
+from query import retrieve, get_reranker
 from tools import TOOLS
 from web_search import web_search
 from sentence_boundary import first_sentence, SENTENCE_BOUNDARY_RE, MIN_SENTENCE_WORDS
@@ -143,8 +143,26 @@ max_new_tokens = 100  # answers are short (a sentence, or one CALL: line), not
                        # a 200 token completion like talk.py's raw sampling
 temperature = 0.8
 top_k = 200
-rerank_threshold = 7.0  # same gate query.py's own retrieve() default uses,
-                         # named here too since it drives the banner/citation text
+# Nucleus sampling (Holtzman et al. 2019, arXiv:1904.09751), added to
+# model.py's generate() as a new, backward compatible top_p=None default;
+# 0.9 is the value both that paper and HuggingFace's own generation
+# defaults converge on. Composes with top_k above (top_k filters first,
+# top_p narrows further), free per token, applied to every generate() call
+# in this file, not just the RAG shapes N_BEST_OF below is scoped to.
+top_p = 0.9
+# Best-of-N reranking, RAG shapes only (real Context: content, vector doc
+# or live search result): generates N_BEST_OF real candidates and keeps
+# the one query.py's already-loaded CrossEncoder scores as most relevant
+# to the question, the identical (query_text, content) -> predict() shape
+# query.py's own search() already uses for RAG chunk reranking, just
+# re-pointed at generated candidates instead of retrieved chunks. Not
+# applied to tool-call or refusal generations: dispatch_call()'s own
+# docstring already makes the reason explicit for tool calls ("a second
+# generate() call could only add a chance to say something wrong on top of
+# a right answer"), and a CrossEncoder trained for question/passage
+# relevance has no meaningful signal to rank refusal candidates against
+# each other.
+N_BEST_OF = 4
 seed = 1337
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16'
@@ -328,9 +346,36 @@ def _generate(prefix):
         with _ctx:
             start_ids = _encode(prefix)
             x = torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...]
-            y = _model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
+            y = _model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k, top_p=top_p)
     generated_ids = y[0].tolist()[len(start_ids):]
     return _decode(generated_ids).split("\n")[0].strip()
+
+
+def _best_of_n_generate(prefix, question, n=N_BEST_OF):
+    """Generates n real candidates via _generate() and keeps the one
+    query.py's already-loaded CrossEncoder scores as most relevant to the
+    question, the identical (query_text, content) -> reranker.predict()
+    shape query.py's own search() already uses to rerank retrieved RAG
+    chunks (cloned from there, not reinvented), just re-pointed at
+    generated candidates instead of retrieved chunks. Only ever called
+    from a Context:-having prompt (a real vector doc or live search
+    result), where "how relevant is this candidate to the question" is a
+    meaningful signal; never from a tool-call or refusal generation, see
+    the N_BEST_OF module comment for why.
+
+    n=1 skips the reranker call entirely, not just short circuits after
+    one candidate: real code paths with N_BEST_OF overridden to 1 (a test,
+    or a future config change) should not pay for a CrossEncoder load that
+    was never going to change the outcome.
+    """
+    candidates = [_generate(prefix) for _ in range(n)]
+    if n <= 1:
+        return candidates[0]
+    reranker = get_reranker()
+    pairs = [(question, c) for c in candidates]
+    scores = reranker.predict(pairs, show_progress_bar=False)
+    best_i = max(range(len(candidates)), key=lambda i: scores[i])
+    return candidates[best_i]
 
 
 def build_prompt(question, use_retrieval=True):
@@ -554,8 +599,22 @@ def answer_turn(question, mode="auto"):
                corpus alone. A refusal there is tagged with which of the two
                things happened, retrieval finding nothing or the model
                refusing what it found, the same distinction "auto" draws.
+      "model"  closed-book (the standard term for a QA system answering
+               from model weights only, no retrieval — see e.g. arXiv
+               2607.21861): both the vector store AND the live search
+               fallback are off, tool calls still dispatch. Neither "web"
+               nor "vector" alone was this — "web" turns retrieval off but
+               still falls back to a live search on refusal, "vector" never
+               searches but still runs retrieval. This is their
+               intersection, added on direct instruction ("I'd rather the
+               AI be bad than not use the AI, I need to show I made it"):
+               an answer under this mode is never anything but the model's
+               own trained weights, whatever the question. gui.py's Source
+               toggle labels it "Model only, never search".
     The web: prefix is checked before mode either way, so it stays a real
-    override that works no matter what the toggle is set to.
+    override that works no matter what the toggle is set to: it is an
+    explicit, typed command to search, not an automatic fallback, so it is
+    not what "model" mode's "never search" promise is about.
 
     Returns a dict, not just the printable string, so the GUI's RAG context
     viewer can show the exact text that was fed into the model without
@@ -609,7 +668,7 @@ def _live_search_answer(question):
         return result, None, result
     load()
     prefix, context_text = _context_prompt(question, result)
-    answer = first_sentence(_generate(prefix))
+    answer = first_sentence(_best_of_n_generate(prefix, question))
     return answer, context_text, result
 
 
@@ -626,8 +685,15 @@ def _run_turn(question, mode):
                 "web_result": result}
 
     load()
-    prefix, source, context_text = build_prompt(question, use_retrieval=(mode != "web"))
-    answer = _generate(prefix)
+    prefix, source, context_text = build_prompt(question, use_retrieval=(mode not in ("web", "model")))
+    # Best-of-N only for a real Context:-having prompt (source is not None,
+    # already gated in build_prompt() to a title the model was actually
+    # trained to paraphrase): that's the only shape a question/candidate
+    # relevance score means anything for. A "Context: (none)" prompt (tool
+    # question, greeting, real no-match) gets the single, cheaper
+    # _generate() call it always has, same reasoning N_BEST_OF's own
+    # module comment gives for skipping tool calls and refusals.
+    answer = _best_of_n_generate(prefix, question) if source is not None else _generate(prefix)
 
     call_match = CALL_RE.search(answer)
     if call_match:
@@ -642,8 +708,8 @@ def _run_turn(question, mode):
         # The model's own refusal is the authoritative signal that no local
         # answer exists, whatever retrieval thought.
         source_title = source["metadata"]["title"] if source is not None else None
-        if mode == "vector":
-            # What this toggle turns off is the live search fallback, not the
+        if mode in ("vector", "model"):
+            # What "vector" turns off is the live search fallback, not the
             # vector store (gui.py's Source toggle labels it "Vector only",
             # against "Model only, web if no match" for mode="web"), so the
             # refusal is the real answer here rather than a cue to fetch one
@@ -654,7 +720,17 @@ def _run_turn(question, mode):
             # contradicts this file's contract that every answer says where
             # it came from. Same distinction and same wording as the fallback
             # tag below, which has drawn it since this branch was added.
-            why = "model refused the local match" if source is not None else "no confident source found"
+            #
+            # "model" (gui.py's "Model only, never search") is the real
+            # closed-book mode this same stop-here behavior was missing
+            # before: retrieval is off too (build_prompt() call above), so
+            # source is always None here and "no confident source found"
+            # would falsely imply retrieval ran and came up empty. Named
+            # honestly instead: nothing was ever looked up, on either side.
+            if mode == "model":
+                why = "vector store and live search both off"
+            else:
+                why = "model refused the local match" if source is not None else "no confident source found"
             text = f"{answer}\n[{why} — answered from the model's own training only]"
             # A refused context was still really fed to the model this turn,
             # so the GUI's viewer can show what it saw, exactly as it already
@@ -722,10 +798,15 @@ def _run_turn(question, mode):
         return {"text": text, "context": context_text, "source_title": source["metadata"]["title"], "web_result": None}
     else:
         # Same distinction the fallback branch above already draws, and the
-        # same reason: under mode="web" nothing was ever sought, so "no
-        # confident source found" would claim a search happened and came up
-        # empty when retrieve() was never even called.
-        why = "vector store off" if mode == "web" else "no confident source found"
+        # same reason: under mode="web"/"model" nothing was ever sought, so
+        # "no confident source found" would claim a search happened and came
+        # up empty when retrieve() was never even called.
+        if mode == "web":
+            why = "vector store off"
+        elif mode == "model":
+            why = "vector store and live search both off"
+        else:
+            why = "no confident source found"
         text = f"{answer}\n[{why} — answered from the model's own training only]"
         return {"text": text, "context": None, "source_title": None, "web_result": None}
 

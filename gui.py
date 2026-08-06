@@ -1,6 +1,15 @@
 """Single GUI entry point, replaces run.bat/stop.bat/talk.bat/chat.bat.
-Three tabs: Train (start/stop/watch pretraining and SFT), Talk (raw
-completion), Chat (RAG + tool use).
+Two tabs: Train (start/stop/watch pretraining and SFT), and Talk to AI
+(the SFT-trained, template-aware model, tool use, and a Source toggle
+covering everything from full RAG down to closed-book model-only). A
+third tab pointed model/talk.py's raw, un-fine-tuned base checkpoint
+straight at the user's typed question with no template, before this;
+removed because it never really answered questions (the SFT stage's own
+template is what teaches that behavior at all, not something retrieval
+adds), not because model/talk.py itself is gone — it stays as a real
+module, still useful to run directly mid-training to eyeball the base
+checkpoint's own raw completion quality, and it is still what
+toolstore/chat.py's own model loading code was cloned from.
 
 Location independent the same way the batch files were: __file__-relative
 paths, not hardcoded to any one drive. Sets HF_HOME/PIP_CACHE_DIR the same
@@ -20,17 +29,16 @@ this GUI (true on this machine as of writing this file), the GUI can only
 detect that and offer Stop, it was never given that process's stdout
 handle and does not attempt to intercept it after the fact.
 
-Talk and Chat tabs import model/talk.py and toolstore/chat.py directly and
-call their load()/answer()/answer_question() functions from a worker
-thread (same queue+after pattern), rather than spawning them as
-subprocesses: piping to an already-interactive input() loop is a
-documented fragile pattern on Windows (no pty, buffering deadlocks), and
-both files were already split into an importable load()/answer() shape
-for exactly this. If training is detected running, both tabs force
-device='cpu' before their first load(), since pretraining already uses
-most of the card's 12GB VRAM by design (CLAUDE.md) and loading a second
-model onto the GPU at the same time is exactly the risk that rule exists
-to prevent.
+The Talk to AI tab imports toolstore/chat.py directly and calls its
+load()/answer_turn() functions from a worker thread (same queue+after
+pattern), rather than spawning it as a subprocess: piping to an
+already-interactive input() loop is a documented fragile pattern on
+Windows (no pty, buffering deadlocks), and chat.py was already split into
+an importable load()/answer_turn() shape for exactly this. If training is
+detected running, the tab forces device='cpu' before its first load(),
+since pretraining already uses most of the card's 12GB VRAM by design
+(CLAUDE.md) and loading a second model onto the GPU at the same time is
+exactly the risk that rule exists to prevent.
 """
 import logging
 import os
@@ -280,25 +288,20 @@ class _ChatLikeTab(ttk.Frame):
 
     def render_answer(self, payload):
         """Default rendering: payload is the plain answer string. ChatTab
-        overrides this since its _call() returns a richer dict (the answer
-        text plus the RAG context that was actually fed into the model, for
-        the expandable context viewer), TalkTab's payload is already just a
-        string and needs nothing extra.
+        (the only real subclass right now) overrides this since its
+        _call() returns a richer dict (the answer text plus the RAG context
+        that was actually fed into the model, for the expandable context
+        viewer); kept as the base class's own sensible default for a module
+        whose _call() just returns a plain string, not dead code tied to a
+        specific removed subclass.
         """
         self.append(str(payload) + "\n\n")
 
 
-class TalkTab(_ChatLikeTab):
-    module_name = "talk"
-    hint_text = "Raw completion only, no retrieval, no tools, no memory of earlier turns."
-
-    def _call(self, module, text):
-        return module.answer(text)
-
-
 class ChatTab(_ChatLikeTab):
     module_name = "chat"
-    hint_text = "Needs SFT to have finished. Prefix a question with 'web:' to search DuckDuckGo live instead of the local model."
+    hint_text = ("Needs SFT to have finished. Prefix a question with 'web:' to search "
+                 "DuckDuckGo live instead of the local model.")
 
     def __init__(self, master):
         super().__init__(master)
@@ -316,10 +319,19 @@ class ChatTab(_ChatLikeTab):
         # search happens only on the model's own refusal, exactly as under
         # "auto" (see chat.answer_question()'s own docstring). Labelling it
         # "Web only" described the shape this mode had before that redesign.
+        # "model" is the real closed-book mode ("I'd rather the AI be bad
+        # than not use the AI, I need to show I made it"): neither the
+        # vector store nor a live search ever runs, an answer is always the
+        # model's own trained weights and nothing else. This is also what
+        # this GUI's own former separate "Talk to AI" tab (model/talk.py, a
+        # raw, un-fine-tuned base checkpoint) has been replaced by: that tab
+        # never actually answered questions well, since it skipped the SFT
+        # stage's own template entirely, not because it avoided retrieval.
         for value, label in (
             ("auto", "Vector, web if no match"),
             ("vector", "Vector only"),
             ("web", "Model only, web if no match"),
+            ("model", "Model only, never search"),
         ):
             ttk.Radiobutton(modes, text=label, value=value, variable=self.mode_var).pack(side="left", padx=4)
 
@@ -342,8 +354,8 @@ class ChatTab(_ChatLikeTab):
         produced this answer (or the model refused a context it was given),
         the exact text that was in the Context: block this turn. Renders a
         clickable "[+ show RAG context]" link right under the answer when
-        there is one; everything else prints exactly like TalkTab's plain
-        text.
+        there is one; everything else prints as plain text, the same shape
+        _ChatLikeTab's own default render_answer() uses.
         """
         self.output.configure(state="normal")
         self.output.insert("end", result["text"])
@@ -406,8 +418,7 @@ def main():
     notebook.pack(fill="both", expand=True)
 
     notebook.add(TrainTab(notebook), text="Train")
-    notebook.add(TalkTab(notebook), text="Talk to AI")
-    notebook.add(ChatTab(notebook), text="Talk to AI using RAG")
+    notebook.add(ChatTab(notebook), text="Talk to AI")
 
     root.mainloop()
 

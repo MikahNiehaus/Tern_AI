@@ -88,13 +88,17 @@ flowchart TD
     GEN --> OUT{output shape}
     OUT -->|"CALL: tool(args)"| DISPATCH[run the real tool,\nprint the real result]
     OUT -->|plain text| PRINT[print, tagged with\nits source or lack of one]
-    IN -->|"web: question"| DDG[live DuckDuckGo search,\nprinted directly,\nnever fed to the model]
+    IN -->|"web: question"| DDG[live DuckDuckGo search,\nfed back in as context,\nmodel answers from it]
 ```
 
-Tool calls and web search results are never routed back through the model
-to be rephrased. A calculator result or a live search hit is already
-correct, so the loop prints it as is instead of giving the model a chance
-to say something wrong on top of a right answer.
+A tool call's result is never routed back through the model to be
+rephrased. A calculator result is already correct, so the loop prints it as
+is instead of giving the model a chance to say something wrong on top of a
+right answer. A live search hit is the other case: it is a passage, not an
+answer, so it goes back in as a `Context:` block and the model generates
+the real answer from it, tagged `AI generated`. Only a search that failed
+or returned nothing prints verbatim, since there is no passage there to
+ground an answer in.
 
 ## Stack
 
@@ -105,7 +109,7 @@ itself.
 
 ## Running it
 
-One entry point, `gui.bat`, a small tkinter app with three tabs:
+One entry point, `gui.bat`, a small tkinter app with two tabs:
 
 ```
 Train                     start/stop pretraining, downloading the Simple
@@ -114,19 +118,43 @@ Train                     start/stop pretraining, downloading the Simple
                            rebuilding the fine tuning dataset and starting a
                            fresh fine tuning run if the data it was trained
                            on ever changes), live log output
-Talk to AI                talk to whatever checkpoint currently exists, raw
-                           completion, no retrieval, no tools
-Talk to AI using RAG      the real interface, needs fine tuning to be done,
-                           retrieval and tool use both live here
+Talk to AI                the real interface, needs fine tuning to be done,
+                           retrieval, tool use, and everything from full RAG
+                           down to closed book answering all live here,
+                           picked per question with the Source toggle
 ```
 
-The "Talk to AI using RAG" tab has a Source toggle: answer from the vector
-store with DuckDuckGo as a fallback when nothing confident is found (the
-default), the vector store only with no fallback, or the model on its own
-with DuckDuckGo only as a fallback. Typing a plain question uses whichever
-is selected; prefixing a question with `web: ` always searches DuckDuckGo
-live instead, regardless of the toggle, and prints the result directly,
-never through the model. Any answer grounded in a retrieved passage has a
+The Source toggle has four settings, most grounded first:
+
+```
+Vector, web if no match      the default: answer from the vector store,
+                              falling back to a live DuckDuckGo search when
+                              retrieval finds nothing confident or the model
+                              refuses the passage it was handed
+Vector only                  retrieval still runs, the live search fallback
+                              is off, so a refusal is the answer rather than
+                              a cue to go look elsewhere
+Model only, web if no match  the vector store is off and the model answers
+                              on its own, with only its own refusal falling
+                              back to a live search
+Model only, never search     closed book: neither the vector store nor a
+                              live search ever runs, so an answer is the
+                              model's own trained weights and nothing else
+```
+
+Tool calls still dispatch under all four. There is no separate raw base
+model tab any more: `model/talk.py` still exists and is still worth running
+directly to eyeball the base checkpoint's raw completion quality mid
+training, but a GUI tab pointed at it never really answered questions,
+because it skipped the fine tuning stage's prompt template, not because it
+skipped retrieval. Closed book mode is the honest version of what that tab
+was for.
+
+Typing a plain question uses whichever setting is selected; prefixing a
+question with `web: ` always searches DuckDuckGo live instead, regardless
+of the toggle, including in closed book mode, since that is an explicit
+typed command to search rather than the automatic fallback closed book
+turns off. Any answer grounded in a retrieved passage has a
 "show RAG context" link underneath it that expands to the exact text the
 model was actually given that turn, and every real turn (question, mode,
 the full retrieved passage or live search result if one was used, the

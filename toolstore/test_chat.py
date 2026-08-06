@@ -83,6 +83,7 @@ chat.device = "cpu"
 
 _real_chat_log_handlers = None
 _real_get_paraphrase_titles = None
+_real_get_reranker = None
 
 
 def setUpModule():
@@ -103,17 +104,28 @@ def setUpModule():
     tests below out to the no-match branch, none of which are testing that
     gating behavior at all. TestParaphraseTitleGating overrides this default
     per test to actually exercise the gate itself.
+
+    Also patches chat.get_reranker() to _FakeReranker(), same reasoning one
+    level further in: _best_of_n_generate() now calls it for any real
+    Context:-having prompt, and query.py's real get_reranker() lazily loads
+    an actual ~80MB CrossEncoder from HuggingFace on first call, a real
+    network/disk dependency and multi-second cost this file's tests have
+    never needed before and should not start needing just to reach a
+    branch this file's tests are not testing reranking quality on.
     """
-    global _real_chat_log_handlers, _real_get_paraphrase_titles
+    global _real_chat_log_handlers, _real_get_paraphrase_titles, _real_get_reranker
     _real_chat_log_handlers = chat.logger.handlers
     chat.logger.handlers = [logging.NullHandler()]
     _real_get_paraphrase_titles = chat._get_paraphrase_titles
     chat._get_paraphrase_titles = lambda: {"Paris"}
+    _real_get_reranker = chat.get_reranker
+    chat.get_reranker = lambda: _FakeReranker()
 
 
 def tearDownModule():
     chat.logger.handlers = _real_chat_log_handlers
     chat._get_paraphrase_titles = _real_get_paraphrase_titles
+    chat.get_reranker = _real_get_reranker
 
 REFUSAL = "I don't have information about that."
 SEARCH_RESULT = "Paris is the capital of France. (source: example.com)"
@@ -143,9 +155,24 @@ PROFESSOR_SUMMARY = (
 
 
 class _FakeModel:
-    def generate(self, x, max_new_tokens, temperature, top_k):
+    def generate(self, x, max_new_tokens, temperature, top_k, top_p=None):
         # Length only, the faked _decode ignores the ids entirely.
         return torch.cat([x, torch.zeros((1, 5), dtype=torch.long)], dim=1)
+
+
+class _FakeReranker:
+    """Stands in for query.py's real CrossEncoder (an ~80MB downloaded
+    model _best_of_n_generate() now calls for any Context:-having prompt):
+    every existing SOURCE-based test drives install()'s constant fake
+    _decode, so every candidate _best_of_n_generate() generates is already
+    identical text regardless of which one "wins" — this only needs to be
+    fast and deterministic, not a real relevance judge. Uniform scores
+    always pick candidates[0] (Python's max() keeps the first of equal
+    maxima), the same candidate a single, non-best-of-N _generate() call
+    would have produced.
+    """
+    def predict(self, pairs, show_progress_bar=False):
+        return [0.0] * len(pairs)
 
 
 class _ChatFlowTest(unittest.TestCase):
@@ -828,6 +855,67 @@ class TestSearchFailureEndsTheTurnNotTheSession(_ChatFlowTest):
         self.assertIn("[web search error: ddgs internal crash]", out)
 
 
+class TestLiveSearchGeneratedTextIsNeverDispatched(_ChatFlowTest):
+    """The /audit skill's own MEDIUM finding: web_search.py's docstring
+    claims a live-search-generated answer is never passed to
+    CALL_RE/dispatch_call() (closing a prompt injection surface — untrusted
+    search text reaching the same parser a real tool dispatch reads from),
+    proven true by real execution during that audit, but with zero
+    regression coverage. Every other CALL:-dispatch test in this file
+    installs the tool-call string on the FIRST generate() call (the
+    normal, non-search path via install()'s constant fake _decode), so
+    none of them can tell if a future refactor started checking CALL_RE on
+    the SECOND, live-search-derived generate() call too. Mocks
+    chat._generate() directly (bypassing the real model) since that is the
+    only way to make the two generate() calls in one turn return different
+    text; install()'s fake _decode returns the same string for every call.
+
+    install("unused"), not install_model() alone: bad-cop's real, reproduced
+    finding on an earlier version of this class was that install_model()
+    sets chat._model/_ctx but never chat._encode, so _context_prompt()'s own
+    real, unmocked _encode() call (needed for its token budget arithmetic
+    even though _generate() itself is mocked) crashed with a bare
+    TypeError — UNLESS some earlier, unrelated test in the same process had
+    already called install() and left chat._encode pointing at a real
+    callable behind it, which happened to be true under this file's default
+    full-suite run order but made these two tests fail the instant they were
+    run alone (`-k TestLiveSearchGeneratedTextIsNeverDispatched`), the
+    single strongest signal that a test is silently depending on leaked
+    global state from a different test instead of its own real setup.
+    """
+
+    def test_web_prefix_call_text_is_shown_not_dispatched(self):
+        self.install("unused")
+        with mock.patch.object(chat, "retrieve"), \
+                mock.patch.object(chat, "web_search", return_value="a page body (source: example.com)"), \
+                mock.patch.object(chat, "_generate", return_value="CALL: calculator(2+2)") as m_generate, \
+                mock.patch.object(chat, "dispatch_call") as m_dispatch:
+            out = chat.answer_question("web: what is 2 plus 2")
+        # _live_search_answer() runs real content through _best_of_n_generate()
+        # now, N_BEST_OF real _generate() calls (each one identical here,
+        # install()'s fake _decode returns the same text every time), not 1.
+        self.assertEqual(m_generate.call_count, chat.N_BEST_OF)
+        self.assertEqual(m_dispatch.call_count, 0,
+                         "a CALL: line generated from live search text must never be dispatched")
+        self.assertIn("CALL: calculator(2+2)", out)
+
+    def test_refusal_fallback_call_text_is_shown_not_dispatched(self):
+        self.install("unused")
+        with mock.patch.object(chat, "retrieve", return_value=[]), \
+                mock.patch.object(chat, "web_search", return_value="a page body (source: example.com)"), \
+                mock.patch.object(chat, "_generate",
+                                  side_effect=[REFUSAL] + ["CALL: calculator(2+2)"] * chat.N_BEST_OF) as m_generate, \
+                mock.patch.object(chat, "dispatch_call") as m_dispatch:
+            out = chat.answer_question("What is 2 plus 2?")
+        # One call for the initial (source=None, single-_generate()) refusal,
+        # then N_BEST_OF more for the live-search fallback's best-of-N pass.
+        self.assertEqual(m_generate.call_count, 1 + chat.N_BEST_OF,
+                         "the first refusal must trigger a second, live-search-fed generate() call")
+        self.assertEqual(m_dispatch.call_count, 0,
+                         "a CALL: line generated from live search text must never be dispatched")
+        self.assertIn("CALL: calculator(2+2)", out)
+
+
 class TestNoResultsFoundIsNotFedToTheModel(_ChatFlowTest):
     """bad-cop's real finding: a search that genuinely finds nothing used to
     come back from web_search() as a placeholder string that did not start
@@ -901,7 +989,9 @@ class TestDiagnosticSignalCannotComeFromPageContent(_ChatFlowTest):
                 "href": "example.com",
             }]
             result = chat.answer_turn("What is the capital of Freedonia?")
-        self.assertEqual(m_generate.call_count, 2,
+        # One call for the initial refusal, then N_BEST_OF more for the
+        # live-search fallback's best-of-N pass over the colliding body text.
+        self.assertEqual(m_generate.call_count, 1 + chat.N_BEST_OF,
                          "real search content must be generated from, whatever "
                          "its body text happens to start with")
         self.assertEqual(result["context"], colliding)
@@ -986,7 +1076,9 @@ class TestRefusedVectorContextStaysRecoverable(_ChatFlowTest):
 
 
 class TestModeToggle(_ChatFlowTest):
-    """The three values gui.py's Chat tab Source toggle passes as mode=.
+    """The values gui.py's Talk to AI tab Source toggle passes as mode=:
+    "auto", "vector", "web" here, plus "model", which has its own class,
+    TestModelModeIsGenuinelyClosedBook, below.
 
     "web" is the one with real behavior behind it and the one these tests
     are mostly about. It turns off the vector store, NOT the model: an
@@ -1011,7 +1103,9 @@ class TestModeToggle(_ChatFlowTest):
         self.assertEqual(m_web.call_count, 0)
 
     def test_auto_and_vector_modes_still_call_retrieve(self):
-        """The other half of the same wiring: only "web" turns retrieval off."""
+        """The other half of the same wiring: of these three, only "web"
+        turns retrieval off ("model" does too, covered by
+        TestModelModeIsGenuinelyClosedBook)."""
         for mode in ("auto", "vector"):
             with self.subTest(mode=mode):
                 self.install("Paris.")
@@ -1183,6 +1277,99 @@ class TestModeToggle(_ChatFlowTest):
                                     "the raw DuckDuckGo text must never be shown untouched")
                 self.assertIn("unused", out)
                 self.assertIn("[source: live search result (DuckDuckGo), AI generated]", out)
+
+
+class TestModelModeIsGenuinelyClosedBook(_ChatFlowTest):
+    """mode="model" (gui.py's "Model only, never search"), added on direct
+    instruction ("I'd rather the AI be bad than not use the AI, I need to
+    show I made it") after gui.py's separate, base-checkpoint-only "Talk to
+    AI" tab was retired: neither "web" (still searches on refusal) nor
+    "vector" (still runs retrieval) was actually this. The property every
+    test below is really about: under this mode, retrieve() and
+    web_search() must NEVER run, whatever the question or however the
+    model answers it, including its own trained refusal.
+    """
+
+    def test_model_mode_never_calls_retrieve(self):
+        self.install("Paris.")
+        with mock.patch.object(chat, "retrieve", return_value=[SOURCE]) as m_retrieve, \
+                mock.patch.object(chat, "web_search") as m_web:
+            chat.answer_question("What is the capital of France?", mode="model")
+        self.assertEqual(m_retrieve.call_count, 0)
+        self.assertEqual(m_web.call_count, 0)
+
+    def test_model_mode_refusal_never_falls_back_to_search(self):
+        """The real reason this mode exists: "web" reaches this exact
+        scenario and does search. "model" must not, on a genuine refusal,
+        the case a silent live-search fallback is easiest to sneak into.
+        """
+        self.install(REFUSAL)
+        with mock.patch.object(chat, "retrieve", return_value=[SOURCE]) as m_retrieve, \
+                mock.patch.object(chat, "web_search") as m_web:
+            out = chat.answer_question("What is the capital of France?", mode="model")
+        self.assertEqual(m_retrieve.call_count, 0)
+        self.assertEqual(m_web.call_count, 0,
+                         "mode='model' must never search, even on a genuine refusal")
+        self.assertIn(REFUSAL, out)
+
+    def test_model_mode_still_dispatches_a_tool_call(self):
+        self.install("CALL: calculator(17*23)")
+        with mock.patch.object(chat, "retrieve") as m_retrieve, \
+                mock.patch.object(chat, "web_search") as m_web:
+            out = chat.answer_question("What is 17 times 23?", mode="model")
+        self.assertEqual(m_retrieve.call_count, 0)
+        self.assertEqual(m_web.call_count, 0)
+        self.assertIn("[tool: calculator]", out)
+        self.assertIn("391", out)
+
+    def test_model_mode_greeting_does_not_search(self):
+        self.install("Hello! What would you like to know?")
+        with mock.patch.object(chat, "retrieve") as m_retrieve, \
+                mock.patch.object(chat, "web_search") as m_web:
+            out = chat.answer_question("hi", mode="model")
+        self.assertEqual(m_retrieve.call_count, 0)
+        self.assertEqual(m_web.call_count, 0)
+        self.assertIn("Hello!", out)
+
+    def test_model_mode_refusal_tag_says_both_are_off(self):
+        """source is always None under this mode (retrieval never ran), so
+        the tag must not borrow "vector" mode's wording, which assumes
+        retrieval really happened and either found or didn't find a match.
+        """
+        self.install(REFUSAL)
+        with mock.patch.object(chat, "retrieve", return_value=[SOURCE]), \
+                mock.patch.object(chat, "web_search") as m_web:
+            out = chat.answer_question("What is the capital of France?", mode="model")
+        self.assertEqual(m_web.call_count, 0)
+        self.assertIn(
+            "[vector store and live search both off — answered from the model's own training only]", out)
+        self.assertNotIn("model refused the local match", out)
+        self.assertNotIn("no confident source found", out)
+
+    def test_model_mode_unsourced_answer_tag_says_both_are_off(self):
+        """The other branch that reaches this wording: a normal (non
+        refusal) answer with no source, same distinction "web" already
+        draws for itself one mode over.
+        """
+        self.install("Some ordinary trained reply.")
+        with mock.patch.object(chat, "retrieve", return_value=[]), \
+                mock.patch.object(chat, "web_search") as m_web:
+            out = chat.answer_question("What is 2 plus 2 in words?", mode="model")
+        self.assertEqual(m_web.call_count, 0)
+        self.assertIn("[vector store and live search both off", out)
+
+    def test_web_prefix_still_overrides_model_mode(self):
+        """The web: prefix is an explicit, typed command to search, not an
+        automatic fallback, so it stays a real override under this mode
+        too, the same as it already does under "vector".
+        """
+        self.install("unused")
+        with mock.patch.object(chat, "retrieve", return_value=[]) as m_retrieve, \
+                mock.patch.object(chat, "web_search", return_value=SEARCH_RESULT) as m_web:
+            out = chat.answer_question("web: capital of france", mode="model")
+        self.assertFalse(m_retrieve.called)
+        m_web.assert_called_once_with("capital of france")
+        self.assertNotEqual(out, SEARCH_RESULT)
 
 
 class _RealTokenizerTest(_ChatFlowTest):

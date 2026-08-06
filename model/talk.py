@@ -14,14 +14,18 @@ entirely on how far training has actually gotten, early on this will be
 close to gibberish, that is expected, not a bug, see SPEC.md's own honest
 acceptance criteria.
 
-load()/answer() split from the CLI loop so gui.py can import this module
-and call into it directly, worker thread, no subprocess, no stdin piping
-(swiper researched this: piping to an already-running interactive input()
-loop is a documented fragile pattern on Windows, no pty). load() is
-idempotent (safe to call more than once) and saves/restores sys.argv
-around configurator.py's exec, so a GUI's own argv never leaks in as a
-bogus config override (found by swiper: configurator.py reads sys.argv[1:]
-unconditionally at import/exec time).
+load()/answer() split from the CLI loop so this module can be imported and
+called into directly, worker thread, no subprocess, no stdin piping (swiper
+researched this: piping to an already-running interactive input() loop is a
+documented fragile pattern on Windows, no pty). gui.py used it that way
+from a Talk tab of its own until that tab was removed, so this is a CLI
+diagnostic plus an importable module now, not a GUI backend; the shape
+stays because it is also what toolstore/chat.py's own model loading was
+cloned from. load() is idempotent (safe to call more than once) and
+saves/restores sys.argv around configurator.py's exec, so an importing
+caller's own argv never leaks in as a bogus config override (found by
+swiper: configurator.py reads sys.argv[1:] unconditionally at import/exec
+time).
 """
 import os
 import sys

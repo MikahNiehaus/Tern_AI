@@ -311,11 +311,26 @@ class GPT(nn.Module):
         return mfu
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, top_p=None):
         """
         Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
         Most likely you'll want to make sure to be in model.eval() mode of operation for this.
+
+        top_p (nucleus sampling, Holtzman et al. 2019, "The Curious Case of
+        Neural Text Degeneration," arXiv:1904.09751) is a new, optional
+        kwarg, defaulting to None (off) so every existing caller of this
+        method (model/talk.py, model/sample.py, both kept verbatim as
+        nanoGPT's own reference behavior) is unaffected unless it opts in.
+        Applied after top_k, same order HuggingFace's own
+        LogitsProcessorList applies its warpers in, on whatever the top_k
+        filtering already left: masks the lowest cumulative probability
+        mass tokens rather than a fixed count, so the model can pick from
+        very few options when it's confident and more when it isn't,
+        instead of always sampling from the same fixed top_k regardless.
+        Batched (operates on the same (b, vocab) logits shape as the top_k
+        block right above it), adapted from HuggingFace transformers'
+        TopPLogitsWarper.__call__ (src/transformers/generation/logits_process.py).
         """
         for _ in range(max_new_tokens):
             # if the sequence context is growing too long we must crop it at block_size
@@ -328,6 +343,17 @@ class GPT(nn.Module):
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits[logits < v[:, [-1]]] = -float('Inf')
+            # optionally crop to the smallest set of options whose cumulative
+            # probability covers top_p, always keeping at least the single
+            # highest probability option so a very low top_p can never mask
+            # every token
+            if top_p is not None:
+                sorted_logits, sorted_indices = torch.sort(logits, descending=False)
+                cumulative_probs = sorted_logits.softmax(dim=-1).cumsum(dim=-1)
+                sorted_indices_to_remove = cumulative_probs <= (1 - top_p)
+                sorted_indices_to_remove[..., -1:] = 0
+                indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+                logits[indices_to_remove] = -float('Inf')
             # apply softmax to convert logits to (normalized) probabilities
             probs = F.softmax(logits, dim=-1)
             # sample from the distribution
